@@ -1,0 +1,45 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/claude-code/main/mcp-schema.json",
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@anthropic-ai/mcp-server-filesystem",
+        "/Users/jshstorm/Documents/agentic"
+      ],
+      "description": "프로젝트 파일 시스템 접근"
+    }
+  },
+  "resources": {
+    "specs": {
+      "path": "./specs",
+      "description": "스펙 문서 디렉터리"
+    },
+    "agents": {
+      "path": "./.claude/agents",
+      "description": "에이전트 정의 디렉터리"
+    },
+    "skills": {
+      "path": "./.claude/skills",
+      "description": "스킬 패키지 디렉터리"
+    },
+    "commands": {
+      "path": "./.claude/commands",
+      "description": "CLI 명령어 디렉터리"
+    },
+    "ai_docs": {
+      "path": "./ai_docs",
+      "description": "에이전트 참조 지식"
+    },
+    "apps": {
+      "path": "./apps",
+      "description": "애플리케이션 소스 코드"
+    }
+  },
+  "settings": {
+    "defaultAgent": "planner",
+    "specsDir": "./specs",
+    "autoSyncDocs": true
+  }
+}
