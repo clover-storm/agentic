@@ -22,13 +22,14 @@ ASP.NET EF Core 프로젝트에서 동일 레코드에 대한 병렬 요청 시 
 ```
 ConcurrencyPattern/
 ├── src/
-│   ├── ConcurrencyPattern.Core/           # 엔티티, 인터페이스, 커맨드
-│   ├── ConcurrencyPattern.Infrastructure/ # EF Core DbContext, Repository
-│   ├── ConcurrencyPattern.SequentialProcessor/ # Channel 기반 순차 처리
-│   ├── ConcurrencyPattern.Mediator/       # 요청 조율 및 서비스
-│   └── ConcurrencyPattern.Api/            # ASP.NET Core Web API
+│   ├── ConcurrencyPattern.Core/                # 엔티티, 인터페이스, 커맨드
+│   ├── ConcurrencyPattern.Infrastructure/      # EF Core DbContext, Repository
+│   ├── ConcurrencyPattern.Infrastructure.Redis/# Redis Streams + Pub/Sub 분산 처리
+│   ├── ConcurrencyPattern.SequentialProcessor/ # Channel 기반 순차 처리 (단일 인스턴스)
+│   ├── ConcurrencyPattern.Mediator/            # 요청 조율 및 서비스
+│   └── ConcurrencyPattern.Api/                 # ASP.NET Core Web API
 └── tests/
-    └── ConcurrencyPattern.Tests/          # 동시성 테스트
+    └── ConcurrencyPattern.Tests/               # 동시성 테스트
 ```
 
 ### 2.2 핵심 컴포넌트
@@ -210,27 +211,103 @@ public async Task ParallelWithdrawals_ShouldRejectWhenInsufficient()
 
 ---
 
-## 7. 확장 방향
+## 7. Redis 기반 분산 처리 (Infrastructure.Redis)
 
-### 7.1 분산 환경
-```csharp
-// Redis 기반 분산 락으로 확장
-public class DistributedSequentialQueue : ISequentialCommandQueue
+### 7.1 아키텍처
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         분산 환경 아키텍처                                │
+│                                                                          │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐            │
+│  │   API 1      │     │   API 2      │     │   API 3      │            │
+│  │  (Producer)  │     │  (Producer)  │     │  (Producer)  │            │
+│  └──────┬───────┘     └──────┬───────┘     └──────┬───────┘            │
+│         │                    │                    │                     │
+│         └────────────────────┼────────────────────┘                     │
+│                              ↓                                          │
+│  ┌───────────────────────────────────────────────────────────────────┐ │
+│  │                       Redis Server                                 │ │
+│  │  ┌─────────────────────────────────────────────────────────────┐  │ │
+│  │  │ Redis Streams (엔티티별 큐)                                  │  │ │
+│  │  │  stream:Account:id1 → [CMD1, CMD2, ...]                     │  │ │
+│  │  │  stream:Account:id2 → [CMD3, ...]                           │  │ │
+│  │  │  stream:Inventory:id1 → [CMD4, CMD5, ...]                   │  │ │
+│  │  └─────────────────────────────────────────────────────────────┘  │ │
+│  │  ┌─────────────────────────────────────────────────────────────┐  │ │
+│  │  │ Pub/Sub (결과 응답)                                         │  │ │
+│  │  │  response:{commandId} → Result JSON                         │  │ │
+│  │  └─────────────────────────────────────────────────────────────┘  │ │
+│  │  ┌─────────────────────────────────────────────────────────────┐  │ │
+│  │  │ Distributed Lock (복합 커맨드용)                            │  │ │
+│  │  │  lock:Account:id1, lock:Account:id2                         │  │ │
+│  │  └─────────────────────────────────────────────────────────────┘  │ │
+│  └───────────────────────────────────────────────────────────────────┘ │
+│                              ↓                                          │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐            │
+│  │  Consumer 1  │     │  Consumer 2  │     │  Consumer 3  │            │
+│  │  (Worker)    │     │  (Worker)    │     │  (Worker)    │            │
+│  └──────────────┘     └──────────────┘     └──────────────┘            │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 핵심 컴포넌트
+
+| 컴포넌트 | 역할 |
+|----------|------|
+| `RedisSequentialCommandQueue` | Producer - Stream에 커맨드 추가, Pub/Sub으로 결과 대기 |
+| `RedisCommandConsumerWorker` | Consumer - Stream에서 읽어 순차 처리, 결과 발행 |
+| `RedisDistributedLock` | 복합 커맨드용 분산 락 (Redlock) |
+| `RedisConnectionManager` | Redis 연결 풀링 및 재연결 |
+
+### 7.3 처리 흐름
+```
+1. Producer (API)
+   ├─ 커맨드 직렬화 → RedisCommandEnvelope
+   ├─ Redis Stream에 추가 (XADD stream:Account:123)
+   ├─ Pub/Sub 채널 구독 (response:{commandId})
+   └─ 결과 대기 (타임아웃 적용)
+
+2. Consumer (Worker)
+   ├─ Consumer Group으로 Stream 읽기 (XREADGROUP)
+   ├─ 커맨드 역직렬화 및 핸들러 실행
+   ├─ 결과를 Pub/Sub으로 발행 (PUBLISH)
+   └─ 메시지 ACK (XACK)
+
+3. Producer (API)
+   ├─ Pub/Sub에서 결과 수신
+   └─ 결과 역직렬화 후 반환
+```
+
+### 7.4 설정
+```json
 {
-    private readonly IDistributedLockFactory _lockFactory;
-
-    public async Task<TResult> EnqueueAsync<TResult>(IEntityCommand<TResult> command)
-    {
-        var lockKey = $"lock:{command.EntityType}:{command.EntityId}";
-        await using var @lock = await _lockFactory.CreateLockAsync(lockKey);
-        return await ExecuteCommandAsync(command);
-    }
+  "UseRedisQueue": true,
+  "Redis": {
+    "ConnectionString": "localhost:6379",
+    "InstanceName": "ConcurrencyPattern",
+    "CommandTimeoutSeconds": 30,
+    "LockExpirySeconds": 30,
+    "ConsumerGroup": "command-processors",
+    "ConsumerName": ""
+  }
 }
 ```
 
-### 7.2 재시도 정책
+### 7.5 DI 등록
 ```csharp
-// Polly를 사용한 재시도
+// Redis 기반 분산 처리 사용
+services.AddRedisInfrastructure(configuration);
+
+// 또는 InMemory Channel 기반 (단일 인스턴스)
+services.AddSingleton<ISequentialCommandQueue, SequentialCommandQueue>();
+```
+
+---
+
+## 8. 재시도 정책
+
+### 8.1 Polly를 사용한 재시도
+```csharp
 var retryPolicy = Policy
     .Handle<ConcurrencyException>()
     .WaitAndRetryAsync(3, i => TimeSpan.FromMilliseconds(100 * i));
@@ -240,9 +317,9 @@ await retryPolicy.ExecuteAsync(() => _mediator.SendAsync(command));
 
 ---
 
-## 8. API 엔드포인트
+## 9. API 엔드포인트
 
-### 8.1 계좌 API
+### 9.1 계좌 API
 | Method | Endpoint | 설명 |
 |--------|----------|------|
 | GET | /api/accounts | 계좌 목록 |
@@ -252,7 +329,7 @@ await retryPolicy.ExecuteAsync(() => _mediator.SendAsync(command));
 | POST | /api/accounts/{id}/withdraw | 출금 |
 | POST | /api/accounts/transfer | 이체 |
 
-### 8.2 재고 API
+### 9.2 재고 API
 | Method | Endpoint | 설명 |
 |--------|----------|------|
 | GET | /api/inventories | 재고 목록 |
@@ -265,7 +342,7 @@ await retryPolicy.ExecuteAsync(() => _mediator.SendAsync(command));
 
 ---
 
-## 9. 참고 자료
+## 10. 참고 자료
 
 - [System.Threading.Channels](https://docs.microsoft.com/en-us/dotnet/core/extensions/channels)
 - [EF Core Concurrency Tokens](https://docs.microsoft.com/en-us/ef/core/saving/concurrency)

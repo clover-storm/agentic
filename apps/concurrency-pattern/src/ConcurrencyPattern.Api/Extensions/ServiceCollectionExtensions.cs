@@ -2,6 +2,7 @@ using ConcurrencyPattern.Core.Commands;
 using ConcurrencyPattern.Core.Interfaces;
 using ConcurrencyPattern.Infrastructure.Data;
 using ConcurrencyPattern.Infrastructure.Repositories;
+using ConcurrencyPattern.Infrastructure.Redis;
 using ConcurrencyPattern.Mediator.Services;
 using ConcurrencyPattern.SequentialProcessor.Handlers;
 using ConcurrencyPattern.SequentialProcessor.Services;
@@ -22,9 +23,9 @@ public static class ServiceCollectionExtensions
         IConfiguration configuration)
     {
         // DbContext 등록 (InMemory 또는 SQL Server)
-        var useInMemory = configuration.GetValue<bool>("UseInMemoryDatabase", true);
+        var useInMemoryDb = configuration.GetValue<bool>("UseInMemoryDatabase", true);
 
-        if (useInMemory)
+        if (useInMemoryDb)
         {
             services.AddDbContext<AppDbContext>(options =>
                 options.UseInMemoryDatabase("ConcurrencyPatternDb"));
@@ -38,8 +39,19 @@ public static class ServiceCollectionExtensions
         // Repository 및 UnitOfWork 등록
         services.AddScoped<IUnitOfWork, UnitOfWork>();
 
-        // 순차 처리 큐 등록 (Singleton - 전역 상태 관리)
-        services.AddSingleton<ISequentialCommandQueue, SequentialCommandQueue>();
+        // 순차 처리 큐 등록 (Redis 또는 InMemory)
+        var useRedis = configuration.GetValue<bool>("UseRedisQueue", false);
+
+        if (useRedis)
+        {
+            // Redis Streams + Pub/Sub 기반 분산 큐
+            services.AddRedisInfrastructure(configuration);
+        }
+        else
+        {
+            // 인메모리 Channel 기반 큐 (단일 인스턴스)
+            services.AddSingleton<ISequentialCommandQueue, SequentialCommandQueue>();
+        }
 
         // Mediator 등록
         services.AddScoped<ICommandMediator, CommandMediator>();
