@@ -28,9 +28,10 @@ public class ConcurrencyTests : IDisposable
     {
         var services = new ServiceCollection();
 
-        // InMemory DbContext
+        // InMemory DbContext - GUID를 미리 생성하여 모든 컨텍스트가 같은 DB를 사용하도록 함
+        var databaseName = $"TestDb_{Guid.NewGuid()}";
         services.AddDbContext<AppDbContext>(options =>
-            options.UseInMemoryDatabase($"TestDb_{Guid.NewGuid()}"));
+            options.UseInMemoryDatabase(databaseName));
 
         // Logging
         services.AddLogging(builder => builder.AddDebug());
@@ -82,8 +83,10 @@ public class ConcurrencyTests : IDisposable
         // Assert
         results.Should().AllSatisfy(r => r.Success.Should().BeTrue());
 
-        // 최종 잔액 확인 (초기 1000 + 100 * 10 = 2000)
-        var finalAccount = await _dbContext.Accounts.FindAsync(accountId);
+        // 최종 잔액 확인 (초기 1000 + 100 * 10 = 2000) - 새 스코프에서 검증
+        using var verifyScope = _serviceProvider.CreateScope();
+        var verifyContext = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var finalAccount = await verifyContext.Accounts.FindAsync(accountId);
         finalAccount!.Balance.Should().Be(1000m + (depositAmount * numberOfDeposits));
     }
 
@@ -124,8 +127,10 @@ public class ConcurrencyTests : IDisposable
         successCount.Should().Be(5); // 500 / 100 = 5개만 성공
         failCount.Should().Be(5);    // 나머지 5개는 잔액 부족으로 실패
 
-        // 최종 잔액은 0이어야 함
-        var finalAccount = await _dbContext.Accounts.FindAsync(accountId);
+        // 최종 잔액은 0이어야 함 - 새 스코프에서 검증
+        using var verifyScope = _serviceProvider.CreateScope();
+        var verifyContext = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var finalAccount = await verifyContext.Accounts.FindAsync(accountId);
         finalAccount!.Balance.Should().Be(0m);
     }
 
@@ -164,9 +169,12 @@ public class ConcurrencyTests : IDisposable
         // Assert
         results.Should().AllSatisfy(r => r.Success.Should().BeTrue());
 
+        // 새 스코프에서 검증
+        using var verifyScope = _serviceProvider.CreateScope();
+        var verifyContext = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
         foreach (var account in accounts)
         {
-            var updated = await _dbContext.Accounts.FindAsync(account.Id);
+            var updated = await verifyContext.Accounts.FindAsync(account.Id);
             updated!.Balance.Should().Be(1500m);
         }
     }
@@ -204,11 +212,13 @@ public class ConcurrencyTests : IDisposable
 
         var results = await Task.WhenAll(tasks);
 
-        // Assert
+        // Assert - 새 스코프에서 검증
         // 입금: 10 * 100 = 1000
         // 출금: 10 * 50 = 500
         // 최종: 1000 + 1000 - 500 = 1500
-        var finalAccount = await _dbContext.Accounts.FindAsync(accountId);
+        using var verifyScope = _serviceProvider.CreateScope();
+        var verifyContext = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var finalAccount = await verifyContext.Accounts.FindAsync(accountId);
 
         // 출금이 잔액 부족으로 실패할 수 있으므로 성공한 출금만 계산
         var successfulDeposits = results.Where((r, i) => i % 2 == 0 && r.Success).Count();

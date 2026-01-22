@@ -126,7 +126,8 @@ public class RedisContextConsumerTests
         cts.Cancel();
 
         // Assert
-        await task.Should().CompleteWithinAsync(TimeSpan.FromSeconds(5));
+        var completedTask = await Task.WhenAny(task, Task.Delay(TimeSpan.FromSeconds(5)));
+        completedTask.Should().Be(task);
         consumer.IsRunning.Should().BeFalse();
     }
 }

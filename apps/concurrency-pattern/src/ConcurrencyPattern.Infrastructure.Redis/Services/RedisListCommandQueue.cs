@@ -159,7 +159,7 @@ public class RedisListCommandQueue : ISequentialCommandQueue, IDisposable
     /// <summary>
     /// 큐 키 생성 (엔티티별로 별도 큐)
     /// </summary>
-    internal string GetQueueKey(string entityType, Guid entityId)
+    public string GetQueueKey(string entityType, Guid entityId)
     {
         return $"{_queuePrefix}{entityType}:{entityId}";
     }

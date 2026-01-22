@@ -16,7 +16,7 @@ public class RedisCommandEnvelopeTests
     {
         // Arrange
         var accountId = Guid.NewGuid();
-        var command = new DepositCommand(accountId, 100m);
+        var command = new DepositCommand { AccountId = accountId, Amount = 100m };
         var responseChannel = "test:response:123";
 
         // Act
@@ -37,7 +37,7 @@ public class RedisCommandEnvelopeTests
     {
         // Arrange
         var accountId = Guid.NewGuid();
-        var command = new DepositCommand(accountId, 250.50m);
+        var command = new DepositCommand { AccountId = accountId, Amount = 250.50m };
         var envelope = RedisCommandEnvelope.Create(command, "test:response:456");
 
         // Act
@@ -59,7 +59,7 @@ public class RedisCommandEnvelopeTests
         // Arrange
         var accountId = Guid.NewGuid();
         var originalAmount = 500m;
-        var command = new DepositCommand(accountId, originalAmount);
+        var command = new DepositCommand { AccountId = accountId, Amount = originalAmount };
         var envelope = RedisCommandEnvelope.Create(command, "test:response");
 
         // Simulate serialization round-trip
@@ -82,7 +82,7 @@ public class RedisCommandEnvelopeTests
         // Arrange
         var accountId = Guid.NewGuid();
         var amount = 75.25m;
-        var command = new WithdrawCommand(accountId, amount);
+        var command = new WithdrawCommand { AccountId = accountId, Amount = amount };
         var envelope = RedisCommandEnvelope.Create(command, "test:response");
 
         var json = JsonSerializer.Serialize(envelope);
@@ -111,9 +111,7 @@ public class RedisCommandResultTests
         var result = new AccountCommandResult
         {
             Success = true,
-            AccountId = Guid.NewGuid(),
-            NewBalance = 1500m,
-            TransactionAmount = 500m
+            NewBalance = 1500m
         };
 
         // Act
@@ -151,9 +149,7 @@ public class RedisCommandResultTests
         var originalResult = new AccountCommandResult
         {
             Success = true,
-            AccountId = Guid.NewGuid(),
-            NewBalance = 2500m,
-            TransactionAmount = 1000m
+            NewBalance = 2500m
         };
 
         var redisResult = RedisCommandResult.FromSuccess(commandId, originalResult);
@@ -168,9 +164,7 @@ public class RedisCommandResultTests
         // Assert
         restoredResult.Should().NotBeNull();
         restoredResult!.Success.Should().Be(originalResult.Success);
-        restoredResult.AccountId.Should().Be(originalResult.AccountId);
         restoredResult.NewBalance.Should().Be(originalResult.NewBalance);
-        restoredResult.TransactionAmount.Should().Be(originalResult.TransactionAmount);
     }
 
     [Fact]

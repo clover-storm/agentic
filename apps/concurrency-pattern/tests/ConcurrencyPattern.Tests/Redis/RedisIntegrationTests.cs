@@ -93,7 +93,7 @@ public class RedisIntegrationTests : IAsyncLifetime
         // Arrange
         var queueKey = "test:queue:envelope";
         var accountId = Guid.NewGuid();
-        var command = new DepositCommand(accountId, 100m);
+        var command = new DepositCommand { AccountId = accountId, Amount = 100m };
         var envelope = RedisCommandEnvelope.Create(command, "test:response:123");
 
         // Act - Enqueue
@@ -194,9 +194,7 @@ public class RedisIntegrationTests : IAsyncLifetime
             ResultData = JsonSerializer.Serialize(new AccountCommandResult
             {
                 Success = true,
-                AccountId = Guid.NewGuid(),
-                NewBalance = 1500m,
-                TransactionAmount = 500m
+                NewBalance = 1500m
             })
         };
 

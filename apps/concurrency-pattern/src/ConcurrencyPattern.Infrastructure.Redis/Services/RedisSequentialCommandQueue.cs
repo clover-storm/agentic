@@ -175,7 +175,7 @@ public class RedisSequentialCommandQueue : ISequentialCommandQueue, IDisposable
             // 순서대로 분산 락 획득
             foreach (var entityKey in sortedEntities)
             {
-                var lockHandle = await _distributedLock.AcquireAsync(entityKey, cancellationToken: cancellationToken);
+                var lockHandle = await _distributedLock.AcquireAsync(entityKey, ct: cancellationToken);
                 if (lockHandle == null)
                 {
                     throw new InvalidOperationException($"Failed to acquire lock for {entityKey}");

@@ -28,8 +28,10 @@ public class SequentialProcessingTests : IDisposable
     {
         var services = new ServiceCollection();
 
+        // InMemory DbContext - GUID를 미리 생성하여 모든 컨텍스트가 같은 DB를 사용하도록 함
+        var databaseName = $"TestDb_{Guid.NewGuid()}";
         services.AddDbContext<AppDbContext>(options =>
-            options.UseInMemoryDatabase($"TestDb_{Guid.NewGuid()}"));
+            options.UseInMemoryDatabase(databaseName));
 
         services.AddLogging(builder => builder.AddDebug());
 
@@ -41,7 +43,8 @@ public class SequentialProcessingTests : IDisposable
 
         services.AddScoped<ICommandHandler<DepositCommand, AccountCommandResult>, DepositCommandHandler>();
         services.AddScoped<ICommandHandler<WithdrawCommand, AccountCommandResult>, WithdrawCommandHandler>();
-        services.AddScoped<ICommandHandler<AdjustStockCommand, InventoryCommandResult>, AdjustStockCommandHandler>();
+        services.AddScoped<ICommandHandler<AddStockCommand, InventoryCommandResult>, AddStockCommandHandler>();
+        services.AddScoped<ICommandHandler<ReserveStockCommand, InventoryCommandResult>, ReserveStockCommandHandler>();
 
         _serviceProvider = services.BuildServiceProvider();
         _dbContext = _serviceProvider.GetRequiredService<AppDbContext>();
@@ -167,9 +170,9 @@ public class SequentialProcessingTests : IDisposable
         {
             Id = inventoryId,
             ProductCode = "CTX-PROD-001",
-            ProductName = "Context Test Product",
-            Quantity = 100
+            ProductName = "Context Test Product"
         };
+        inventory.AddStock(100);
 
         await _dbContext.Accounts.AddAsync(account);
         await _dbContext.Inventories.AddAsync(inventory);
@@ -184,7 +187,7 @@ public class SequentialProcessingTests : IDisposable
             .ToList();
 
         var inventoryTasks = Enumerable.Range(0, 20)
-            .Select(_ => inventoryService.AdjustStockAsync(inventoryId, 5))
+            .Select(_ => inventoryService.AddStockAsync(inventoryId, 5))
             .ToList();
 
         var allTasks = accountTasks.Cast<Task>().Concat(inventoryTasks.Cast<Task>()).ToList();
@@ -312,18 +315,18 @@ public class SequentialProcessingTests : IDisposable
         {
             Id = inventoryId,
             ProductCode = "STK-001",
-            ProductName = "Stock Test Product",
-            Quantity = 25
+            ProductName = "Stock Test Product"
         };
+        inventory.AddStock(25);
 
         await _dbContext.Inventories.AddAsync(inventory);
         await _dbContext.SaveChangesAsync();
 
         var inventoryService = _serviceProvider.GetRequiredService<IInventoryService>();
 
-        // Act - -10씩 5번 출고 시도 (최대 2번만 성공 가능)
+        // Act - 10씩 5번 재고 예약 시도 (최대 2번만 성공 가능)
         var tasks = Enumerable.Range(0, 5)
-            .Select(_ => inventoryService.AdjustStockAsync(inventoryId, -10))
+            .Select(i => inventoryService.ReserveStockAsync(inventoryId, 10, Guid.NewGuid()))
             .ToList();
 
         var results = await Task.WhenAll(tasks);
@@ -332,14 +335,14 @@ public class SequentialProcessingTests : IDisposable
         var successCount = results.Count(r => r.Success);
         var failCount = results.Count(r => !r.Success);
 
-        successCount.Should().Be(2); // 25 / 10 = 2 (나머지 5는 출고 불가)
+        successCount.Should().Be(2); // 25 / 10 = 2 (나머지 5는 예약 불가)
         failCount.Should().Be(3);
 
         using var verifyScope = _serviceProvider.CreateScope();
         var verifyContext = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var finalInventory = await verifyContext.Inventories.FindAsync(inventoryId);
 
-        finalInventory!.Quantity.Should().Be(5); // 25 - 20 = 5
+        finalInventory!.AvailableQuantity.Should().Be(5); // 25 - 20 = 5
     }
 
     public void Dispose()
