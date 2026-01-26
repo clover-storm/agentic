@@ -97,4 +97,79 @@ public static class ServiceCollectionExtensions
 
         return services;
     }
+
+    /// <summary>
+    /// Strand 기반 분산 순차 처리 인프라 등록 (N개 Consumer 지원)
+    ///
+    /// Boost.Asio Strand 패턴 적용:
+    /// ┌─────────────────────────────────────────────────────────────────┐
+    /// │              Strand-based Distributed Processing                │
+    /// ├─────────────────────────────────────────────────────────────────┤
+    /// │                                                                 │
+    /// │   Consumer 1         Consumer 2         Consumer 3              │
+    /// │   ┌─────────┐        ┌─────────┐        ┌─────────┐            │
+    /// │   │Lock: A:1│        │Lock: A:2│        │Lock: B:1│            │
+    /// │   └────┬────┘        └────┬────┘        └────┬────┘            │
+    /// │        ↓                  ↓                  ↓                  │
+    /// │   Queue:A:1          Queue:A:2          Queue:B:1              │
+    /// │   (순차처리)          (순차처리)          (순차처리)            │
+    /// │                                                                 │
+    /// │   ✅ Entity별 순차 보장  ✅ Entity간 병렬  ✅ N개 Consumer      │
+    /// │   ✅ Consumer 장애 시 Lock TTL 만료 후 다른 Consumer 인계      │
+    /// └─────────────────────────────────────────────────────────────────┘
+    ///
+    /// 특징:
+    /// - 동일 Entity 내: 순차 처리 보장 (분산 Lock)
+    /// - 다른 Entity 간: 완전 병렬 처리
+    /// - Single Point of Failure 제거 (N개 Consumer 가능)
+    /// - Consumer 장애 시 자동 인계 (Lock TTL)
+    /// </summary>
+    public static IServiceCollection AddRedisStrandInfrastructure(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        services.Configure<RedisSettings>(
+            configuration.GetSection(RedisSettings.SectionName));
+
+        // 핵심 인프라
+        services.AddSingleton<IRedisConnectionManager, RedisConnectionManager>();
+        services.AddSingleton<IRedisDistributedLock, RedisDistributedLock>();
+
+        // Strand 조정자 (Producer 측)
+        services.AddSingleton<IStrandCoordinator, StrandCoordinator>();
+
+        // Producer 큐 (기존 List 기반 재사용)
+        services.AddSingleton<ISequentialCommandQueue, RedisListCommandQueue>();
+
+        // Strand Consumer (분산 Lock 기반)
+        services.AddHostedService<StrandConsumer>();
+
+        return services;
+    }
+
+    /// <summary>
+    /// Event-Driven Strand Consumer 등록 (Pub/Sub 기반 알림)
+    ///
+    /// 기본 Strand Consumer와 차이:
+    /// - Polling 대신 Pub/Sub으로 새 Strand 알림 수신
+    /// - Consumer Heartbeat로 가용성 등록
+    /// - 더 빠른 반응 시간
+    /// </summary>
+    public static IServiceCollection AddRedisEventDrivenStrandInfrastructure(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        services.Configure<RedisSettings>(
+            configuration.GetSection(RedisSettings.SectionName));
+
+        services.AddSingleton<IRedisConnectionManager, RedisConnectionManager>();
+        services.AddSingleton<IRedisDistributedLock, RedisDistributedLock>();
+        services.AddSingleton<IStrandCoordinator, StrandCoordinator>();
+        services.AddSingleton<ISequentialCommandQueue, RedisListCommandQueue>();
+
+        // Event-Driven Consumer (Pub/Sub 기반)
+        services.AddHostedService<EventDrivenStrandConsumer>();
+
+        return services;
+    }
 }
