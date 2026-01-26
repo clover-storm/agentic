@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  # Concurrency Pattern API
+  api:
+    build:
+      context: ./apps/concurrency-pattern
+      dockerfile: Dockerfile
+    container_name: concurrency-pattern-api
+    ports:
+      - "8080:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:8080
+      - UseInMemoryDatabase=true
+      - UseRedisQueue=false
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/accounts", "||", "exit", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # Concurrency Pattern API with Redis Queue enabled
+  api-with-redis:
+    build:
+      context: ./apps/concurrency-pattern
+      dockerfile: Dockerfile
+    container_name: concurrency-pattern-api-redis
+    ports:
+      - "8081:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:8080
+      - UseInMemoryDatabase=true
+      - UseRedisQueue=true
+      - Redis__ConnectionString=redis:6379
+      - Redis__InstanceName=ConcurrencyPattern
+      - Redis__CommandTimeoutSeconds=30
+      - Redis__LockExpirySeconds=30
+      - Redis__ConsumerGroup=command-processors
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - redis
+    restart: unless-stopped
+
+  # Redis for distributed queue
+  redis:
+    image: redis:7-alpine
+    container_name: concurrency-pattern-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # Redis Commander (Web UI for Redis) - optional
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: redis-commander
+    ports:
+      - "8082:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    depends_on:
+      - redis
+    profiles:
+      - tools
+    restart: unless-stopped
+
+volumes:
+  redis-data:

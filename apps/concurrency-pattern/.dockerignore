@@ -1,0 +1,26 @@
+# Build outputs
+**/bin/
+**/obj/
+**/out/
+**/publish/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.userosscache
+*.suo
+*.sln.docstates
+
+# Test results
+**/TestResults/
+
+# NuGet
+**/packages/
+
+# Misc
+**/.git
+**/.gitignore
+**/README.md
+**/Thumbs.db
+**/.DS_Store
