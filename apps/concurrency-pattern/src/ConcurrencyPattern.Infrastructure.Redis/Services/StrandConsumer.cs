@@ -1,11 +1,12 @@
+using System.Collections.Concurrent;
+using System.Text.Json;
+using ConcurrencyPattern.Core.Interfaces;
 using ConcurrencyPattern.Infrastructure.Redis.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
-using System.Collections.Concurrent;
-using System.Text.Json;
 
 namespace ConcurrencyPattern.Infrastructure.Redis.Services;
 
@@ -18,11 +19,19 @@ namespace ConcurrencyPattern.Infrastructure.Redis.Services;
 /// - N개 Consumer 프로세스 지원 (SPOF 제거)
 ///
 /// 동작 원리:
-/// 1. Redis Set에서 활성 Strand 목록 조회
-/// 2. 각 Strand에 대해 분산 Lock 획득 시도
-/// 3. Lock 획득 성공 시 해당 Strand의 Queue 처리
-/// 4. 처리 완료 또는 Batch Timeout 시 Lock 해제
-/// 5. 다른 Consumer가 해당 Strand 인계 가능
+/// 1. KEYS 스캔으로 활성 Strand(Entity Queue) 발견
+/// 2. 각 Strand에 대해 분산 Lock 획득 시도 (Non-blocking)
+/// 3. Lock 획득 성공 시 해당 Strand의 Queue를 순차 처리
+/// 4. Batch 완료 또는 큐가 비면 Lock 해제 → 다른 Consumer가 인계 가능
+/// 5. Consumer 장애 시 Lock TTL 만료 후 자동 인계
+///
+///   Consumer 1          Consumer 2          Consumer 3
+///   ┌─────────┐        ┌─────────┐        ┌─────────┐
+///   │Lock:A:1 │        │Lock:A:2 │        │Lock:B:1 │
+///   └────┬────┘        └────┬────┘        └────┬────┘
+///        ↓                  ↓                  ↓
+///   Queue:A:1          Queue:A:2          Queue:B:1
+///   (순차처리)          (순차처리)          (순차처리)
 /// </summary>
 public class StrandConsumer : BackgroundService
 {
@@ -30,20 +39,23 @@ public class StrandConsumer : BackgroundService
     private readonly IRedisDistributedLock _distributedLock;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly RedisSettings _settings;
-    private readonly ILogger<StrandConsumer> _logger;
+    private readonly ILogger _logger;
 
-    private readonly string _strandRegistryKey;
     private readonly string _queuePrefix;
     private readonly string _consumerId;
 
-    // 현재 이 Consumer가 소유한 Strand 목록
+    /// <summary>
+    /// 현재 이 Consumer가 소유한 Strand 목록
+    /// Key: strandKey (예: "Account:123"), Value: 처리 Task
+    /// </summary>
     private readonly ConcurrentDictionary<string, Task> _ownedStrands = new();
 
-    // 설정값
-    private readonly TimeSpan _strandLeaseTime = TimeSpan.FromSeconds(30);
-    private readonly TimeSpan _batchTimeout = TimeSpan.FromSeconds(5);
-    private readonly int _maxBatchSize = 100;
-    private readonly TimeSpan _discoveryInterval = TimeSpan.FromSeconds(2);
+    // Strand 설정
+    private readonly TimeSpan _strandLeaseTime;
+    private readonly TimeSpan _batchTimeout;
+    private readonly int _maxBatchSize;
+    private readonly TimeSpan _discoveryInterval;
+    private readonly int _maxIdleIterations;
 
     public StrandConsumer(
         IRedisConnectionManager connectionManager,
@@ -58,12 +70,55 @@ public class StrandConsumer : BackgroundService
         _settings = settings.Value;
         _logger = logger;
 
-        _strandRegistryKey = $"{_settings.InstanceName}:strand-registry";
         _queuePrefix = $"{_settings.InstanceName}:queue:";
         _consumerId = $"{Environment.MachineName}:{Guid.NewGuid():N}";
 
-        _logger.LogInformation("StrandConsumer initialized: {ConsumerId}", _consumerId);
+        // Strand 설정 (RedisSettings에서 로드)
+        _strandLeaseTime = TimeSpan.FromSeconds(_settings.StrandLeaseSeconds);
+        _batchTimeout = TimeSpan.FromSeconds(_settings.StrandBatchTimeoutSeconds);
+        _maxBatchSize = _settings.StrandMaxBatchSize;
+        _discoveryInterval = TimeSpan.FromSeconds(_settings.StrandDiscoveryIntervalSeconds);
+        _maxIdleIterations = _settings.StrandMaxIdleIterations;
+
+        _logger.LogInformation(
+            "StrandConsumer initialized: {ConsumerId}, Lease={Lease}s, Batch={Batch}s/{MaxBatch}, Discovery={Discovery}s",
+            _consumerId, _strandLeaseTime.TotalSeconds, _batchTimeout.TotalSeconds,
+            _maxBatchSize, _discoveryInterval.TotalSeconds);
     }
+
+    /// <summary>
+    /// 내부 생성자 (EventDrivenStrandConsumer용)
+    /// </summary>
+    internal StrandConsumer(
+        IRedisConnectionManager connectionManager,
+        IRedisDistributedLock distributedLock,
+        IServiceScopeFactory scopeFactory,
+        IOptions<RedisSettings> settings,
+        ILogger logger,
+        string? overrideConsumerId)
+    {
+        _connectionManager = connectionManager;
+        _distributedLock = distributedLock;
+        _scopeFactory = scopeFactory;
+        _settings = settings.Value;
+        _logger = logger;
+
+        _queuePrefix = $"{_settings.InstanceName}:queue:";
+        _consumerId = overrideConsumerId ?? $"{Environment.MachineName}:{Guid.NewGuid():N}";
+
+        _strandLeaseTime = TimeSpan.FromSeconds(_settings.StrandLeaseSeconds);
+        _batchTimeout = TimeSpan.FromSeconds(_settings.StrandBatchTimeoutSeconds);
+        _maxBatchSize = _settings.StrandMaxBatchSize;
+        _discoveryInterval = TimeSpan.FromSeconds(_settings.StrandDiscoveryIntervalSeconds);
+        _maxIdleIterations = _settings.StrandMaxIdleIterations;
+    }
+
+    // 서브클래스에서 접근 가능하도록 protected
+    protected string ConsumerId => _consumerId;
+    protected IRedisConnectionManager ConnectionManager => _connectionManager;
+    protected IRedisDistributedLock DistributedLock => _distributedLock;
+    protected RedisSettings Settings => _settings;
+    protected ConcurrentDictionary<string, Task> OwnedStrands => _ownedStrands;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -87,8 +142,8 @@ public class StrandConsumer : BackgroundService
             }
         }
 
-        // Graceful shutdown: 소유한 모든 Strand 해제
         await ReleaseAllStrandsAsync();
+        _logger.LogInformation("StrandConsumer stopped: {ConsumerId}", _consumerId);
     }
 
     /// <summary>
@@ -96,10 +151,7 @@ public class StrandConsumer : BackgroundService
     /// </summary>
     private async Task DiscoverAndClaimStrandsAsync(CancellationToken ct)
     {
-        var db = _connectionManager.GetDatabase();
-
-        // 1. 활성 Strand 목록 조회 (Queue가 존재하는 Entity들)
-        var activeStrands = await DiscoverActiveStrandsAsync(db);
+        var activeStrands = await DiscoverActiveStrandsAsync();
 
         foreach (var strandKey in activeStrands)
         {
@@ -108,13 +160,12 @@ public class StrandConsumer : BackgroundService
             // 이미 소유 중인 Strand는 스킵
             if (_ownedStrands.ContainsKey(strandKey)) continue;
 
-            // 2. Strand Lock 획득 시도 (Non-blocking)
+            // Strand Lock 획득 시도 (Non-blocking)
             var lockResource = $"strand:{strandKey}";
             if (await _distributedLock.TryAcquireAsync(lockResource, _strandLeaseTime, ct))
             {
                 _logger.LogInformation("Claimed strand: {Strand} by {Consumer}", strandKey, _consumerId);
 
-                // 3. Strand 처리 Task 시작
                 var processingTask = ProcessStrandAsync(strandKey, lockResource, ct);
                 _ownedStrands.TryAdd(strandKey, processingTask);
             }
@@ -125,18 +176,34 @@ public class StrandConsumer : BackgroundService
     }
 
     /// <summary>
+    /// 추가 Strand를 즉시 claim (EventDrivenStrandConsumer에서 호출)
+    /// </summary>
+    internal async Task TryClaimStrandAsync(string strandKey, CancellationToken ct)
+    {
+        if (_ownedStrands.ContainsKey(strandKey)) return;
+
+        var lockResource = $"strand:{strandKey}";
+        if (await _distributedLock.TryAcquireAsync(lockResource, _strandLeaseTime, ct))
+        {
+            _logger.LogInformation("Claimed strand (event-driven): {Strand} by {Consumer}", strandKey, _consumerId);
+
+            var processingTask = ProcessStrandAsync(strandKey, lockResource, ct);
+            _ownedStrands.TryAdd(strandKey, processingTask);
+        }
+    }
+
+    /// <summary>
     /// Queue Key 패턴에서 활성 Strand 목록 발견
     /// </summary>
-    private async Task<IEnumerable<string>> DiscoverActiveStrandsAsync(IDatabase db)
+    private async Task<IReadOnlyList<string>> DiscoverActiveStrandsAsync()
     {
         var server = _connectionManager.GetServer();
         var pattern = $"{_queuePrefix}*";
-
-        var strands = new HashSet<string>();
+        var strands = new List<string>();
 
         await foreach (var key in server.KeysAsync(pattern: pattern))
         {
-            // queue:Account:123 → Account:123
+            // "ConcurrencyPattern:queue:Account:123" → "Account:123"
             var strandKey = key.ToString().Replace(_queuePrefix, "");
             strands.Add(strandKey);
         }
@@ -145,7 +212,14 @@ public class StrandConsumer : BackgroundService
     }
 
     /// <summary>
-    /// 단일 Strand 처리 (순차 처리 보장)
+    /// 단일 Strand의 Queue를 순차 처리
+    ///
+    /// 처리 흐름:
+    /// 1. Queue에서 RPOP으로 커맨드 꺼내기
+    /// 2. 커맨드 핸들러 실행 (DI Scope)
+    /// 3. 결과를 Pub/Sub으로 응답
+    /// 4. Batch Timeout 또는 MaxBatchSize 도달 시 Lock TTL 갱신
+    /// 5. 큐가 비면 Idle 대기 후 Lock 해제
     /// </summary>
     private async Task ProcessStrandAsync(string strandKey, string lockResource, CancellationToken ct)
     {
@@ -156,17 +230,23 @@ public class StrandConsumer : BackgroundService
         {
             var processedCount = 0;
             var batchStart = DateTime.UtcNow;
+            var idleCount = 0;
 
             while (!ct.IsCancellationRequested)
             {
-                // Batch Timeout 또는 Max Batch Size 도달 시 Lock 갱신 또는 해제
+                // Batch 경계: Lock TTL 갱신
                 if (processedCount >= _maxBatchSize ||
                     DateTime.UtcNow - batchStart > _batchTimeout)
                 {
-                    // Lock 갱신 (Lease 연장) 또는 다른 Consumer에게 양보
-                    if (await ShouldContinueProcessingAsync(db, queueKey))
+                    var queueLength = await db.ListLengthAsync(queueKey);
+                    if (queueLength > 0)
                     {
-                        await RefreshLockAsync(lockResource);
+                        // 원자적 Lock TTL 갱신 (Race Condition 없음)
+                        if (!await _distributedLock.RefreshAsync(lockResource, _strandLeaseTime))
+                        {
+                            _logger.LogWarning("Lost strand ownership: {Strand}", strandKey);
+                            break;
+                        }
                         processedCount = 0;
                         batchStart = DateTime.UtcNow;
                     }
@@ -176,26 +256,28 @@ public class StrandConsumer : BackgroundService
                     }
                 }
 
-                // Queue에서 Command 가져오기 (Non-blocking)
+                // Queue에서 Command 가져오기
                 var commandData = await db.ListRightPopAsync(queueKey);
 
                 if (commandData.IsNullOrEmpty)
                 {
-                    // 큐가 비었으면 잠시 대기 후 재확인
-                    await Task.Delay(100, ct);
-
-                    // 일정 시간 동안 비어있으면 Lock 해제
-                    if (!await ShouldContinueProcessingAsync(db, queueKey))
+                    idleCount++;
+                    if (idleCount >= _maxIdleIterations)
                     {
-                        break;
+                        break; // Idle Timeout → Lock 해제
                     }
+                    await Task.Delay(100, ct);
                     continue;
                 }
 
-                // Command 처리
-                await ProcessCommandAsync(commandData!, strandKey, ct);
+                idleCount = 0;
+                await ExecuteEnvelopeAsync(commandData!, strandKey, ct);
                 processedCount++;
             }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Graceful shutdown
         }
         catch (Exception ex)
         {
@@ -203,7 +285,6 @@ public class StrandConsumer : BackgroundService
         }
         finally
         {
-            // Lock 해제
             await _distributedLock.ReleaseAsync(lockResource);
             _ownedStrands.TryRemove(strandKey, out _);
             _logger.LogInformation("Released strand: {Strand} by {Consumer}", strandKey, _consumerId);
@@ -211,132 +292,105 @@ public class StrandConsumer : BackgroundService
     }
 
     /// <summary>
-    /// 처리 계속 여부 판단 (큐 길이 확인)
+    /// Envelope 역직렬화 → Handler 실행 → 결과 Pub/Sub 발행
     /// </summary>
-    private async Task<bool> ShouldContinueProcessingAsync(IDatabase db, string queueKey)
+    private async Task ExecuteEnvelopeAsync(RedisValue commandData, string strandKey, CancellationToken ct)
     {
-        var length = await db.ListLengthAsync(queueKey);
-        return length > 0;
-    }
+        RedisCommandEnvelope? envelope = null;
 
-    /// <summary>
-    /// Lock Lease 갱신
-    /// </summary>
-    private async Task RefreshLockAsync(string lockResource)
-    {
-        // Lock 해제 후 재획득 (Lease 연장)
-        await _distributedLock.ReleaseAsync(lockResource);
-        await _distributedLock.TryAcquireAsync(lockResource, _strandLeaseTime);
-    }
-
-    /// <summary>
-    /// Command 실행
-    /// </summary>
-    private async Task ProcessCommandAsync(RedisValue commandData, string strandKey, CancellationToken ct)
-    {
         try
         {
-            var envelope = JsonSerializer.Deserialize<RedisCommandEnvelope>(commandData!);
+            envelope = JsonSerializer.Deserialize<RedisCommandEnvelope>(commandData!);
             if (envelope == null)
             {
                 _logger.LogWarning("Failed to deserialize command for strand: {Strand}", strandKey);
                 return;
             }
 
-            _logger.LogDebug("Processing command {CommandId} for strand {Strand}",
+            _logger.LogDebug("Processing command {CommandId} on strand {Strand} by {Consumer}",
+                envelope.CommandId, strandKey, _consumerId);
+
+            var result = await ExecuteCommandAsync(envelope, ct);
+            await PublishResultAsync(envelope.ResponseChannel, result);
+
+            _logger.LogDebug("Command completed: {CommandId} on strand {Strand}",
                 envelope.CommandId, strandKey);
-
-            // Handler 실행 (DI Container 사용)
-            using var scope = _scopeFactory.CreateScope();
-            var result = await ExecuteCommandHandlerAsync(scope.ServiceProvider, envelope, ct);
-
-            // 결과 발행 (Response Channel)
-            if (!string.IsNullOrEmpty(envelope.ResponseChannel))
-            {
-                var db = _connectionManager.GetDatabase();
-                var resultJson = JsonSerializer.Serialize(result);
-                await db.PublishAsync(RedisChannel.Literal(envelope.ResponseChannel), resultJson);
-            }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error processing command for strand: {Strand}", strandKey);
-            // TODO: Dead Letter Queue로 이동
+            _logger.LogError(ex, "Error executing command: {CommandId} on strand {Strand}",
+                envelope?.CommandId, strandKey);
+
+            if (envelope != null)
+            {
+                var errorResult = RedisCommandResult.FromError(envelope.CommandId, ex);
+                await PublishResultAsync(envelope.ResponseChannel, errorResult);
+            }
         }
     }
 
     /// <summary>
-    /// Command Handler 실행 (Reflection 기반)
+    /// 커맨드 핸들러 실행 (DI Scope + Reflection)
+    /// RedisContextConsumer.ExecuteCommandAsync 패턴과 동일
     /// </summary>
-    private async Task<RedisCommandResult> ExecuteCommandHandlerAsync(
-        IServiceProvider serviceProvider,
+    private async Task<RedisCommandResult> ExecuteCommandAsync(
         RedisCommandEnvelope envelope,
         CancellationToken ct)
     {
         try
         {
-            var commandType = Type.GetType(envelope.CommandType!);
-            if (commandType == null)
-            {
-                return new RedisCommandResult
-                {
-                    CommandId = envelope.CommandId,
-                    Success = false,
-                    ErrorMessage = $"Command type not found: {envelope.CommandType}"
-                };
-            }
+            var command = envelope.DeserializeCommand();
 
-            var command = JsonSerializer.Deserialize(envelope.CommandData!, commandType);
-            if (command == null)
-            {
-                return new RedisCommandResult
-                {
-                    CommandId = envelope.CommandId,
-                    Success = false,
-                    ErrorMessage = "Failed to deserialize command"
-                };
-            }
+            using var scope = _scopeFactory.CreateScope();
 
-            // ICommandHandler<TCommand, TResult> 찾기
-            var resultType = Type.GetType(envelope.ResultType!);
-            var handlerType = typeof(Core.Interfaces.ICommandHandler<,>)
-                .MakeGenericType(commandType, resultType!);
+            var commandType = Type.GetType(envelope.CommandType)
+                ?? throw new InvalidOperationException($"Cannot resolve command type: {envelope.CommandType}");
+            var resultType = Type.GetType(envelope.ResultType)
+                ?? throw new InvalidOperationException($"Cannot resolve result type: {envelope.ResultType}");
 
-            var handler = serviceProvider.GetService(handlerType);
-            if (handler == null)
-            {
-                return new RedisCommandResult
-                {
-                    CommandId = envelope.CommandId,
-                    Success = false,
-                    ErrorMessage = $"Handler not found for: {commandType.Name}"
-                };
-            }
+            var handlerType = typeof(ICommandHandler<,>).MakeGenericType(commandType, resultType);
+            var handler = scope.ServiceProvider.GetRequiredService(handlerType);
 
-            // HandleAsync 호출
-            var handleMethod = handlerType.GetMethod("HandleAsync");
-            var resultTask = (Task)handleMethod!.Invoke(handler, new[] { command, ct })!;
+            var handleMethod = handlerType.GetMethod("HandleAsync")
+                ?? throw new InvalidOperationException("HandleAsync method not found");
+
+            var resultTask = (Task)handleMethod.Invoke(handler, new object[] { command, ct })!;
             await resultTask;
 
             var resultProperty = resultTask.GetType().GetProperty("Result");
-            var resultValue = resultProperty!.GetValue(resultTask);
+            var result = resultProperty?.GetValue(resultTask);
 
             return new RedisCommandResult
             {
                 CommandId = envelope.CommandId,
                 Success = true,
-                ResultData = JsonSerializer.Serialize(resultValue),
-                ResultType = envelope.ResultType
+                ResultType = envelope.ResultType,
+                ResultData = JsonSerializer.Serialize(result)
             };
         }
         catch (Exception ex)
         {
-            return new RedisCommandResult
-            {
-                CommandId = envelope.CommandId,
-                Success = false,
-                ErrorMessage = ex.Message
-            };
+            _logger.LogError(ex, "Error executing command handler: {CommandId}", envelope.CommandId);
+            return RedisCommandResult.FromError(envelope.CommandId, ex);
+        }
+    }
+
+    /// <summary>
+    /// 결과를 Pub/Sub 채널로 발행
+    /// </summary>
+    private async Task PublishResultAsync(string channel, RedisCommandResult result)
+    {
+        if (string.IsNullOrEmpty(channel)) return;
+
+        try
+        {
+            var subscriber = _connectionManager.GetSubscriber();
+            var resultJson = JsonSerializer.Serialize(result);
+            await subscriber.PublishAsync(RedisChannel.Literal(channel), resultJson);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error publishing result to channel: {Channel}", channel);
         }
     }
 
@@ -352,18 +406,21 @@ public class StrandConsumer : BackgroundService
 
         foreach (var strand in completedStrands)
         {
-            _ownedStrands.TryRemove(strand, out _);
+            if (_ownedStrands.TryRemove(strand, out var task) && task.IsFaulted)
+            {
+                _logger.LogWarning(task.Exception, "Strand task faulted: {Strand}", strand);
+            }
         }
     }
 
     /// <summary>
-    /// 모든 소유 Strand 해제 (Graceful Shutdown)
+    /// 모든 소유 Strand Lock 해제 (Graceful Shutdown)
     /// </summary>
     private async Task ReleaseAllStrandsAsync()
     {
         _logger.LogInformation("Releasing all strands for consumer: {ConsumerId}", _consumerId);
 
-        foreach (var strand in _ownedStrands.Keys)
+        var tasks = _ownedStrands.Keys.Select(async strand =>
         {
             try
             {
@@ -373,8 +430,9 @@ public class StrandConsumer : BackgroundService
             {
                 _logger.LogWarning(ex, "Error releasing strand: {Strand}", strand);
             }
-        }
+        });
 
+        await Task.WhenAll(tasks);
         _ownedStrands.Clear();
     }
 }

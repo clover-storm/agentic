@@ -14,6 +14,12 @@ public interface IRedisDistributedLock
     Task<IAsyncDisposable?> AcquireAsync(string resource, TimeSpan? expiry = null, CancellationToken ct = default);
     Task<bool> TryAcquireAsync(string resource, TimeSpan? expiry = null, CancellationToken ct = default);
     Task ReleaseAsync(string resource);
+
+    /// <summary>
+    /// Lock Lease 원자적 갱신 (소유자 확인 후 TTL 연장)
+    /// Strand Consumer의 Lock 유지에 사용
+    /// </summary>
+    Task<bool> RefreshAsync(string resource, TimeSpan? expiry = null);
 }
 
 public class RedisDistributedLock : IRedisDistributedLock
@@ -117,6 +123,40 @@ public class RedisDistributedLock : IRedisDistributedLock
         {
             _logger.LogWarning("Lock release failed (not owner or expired): {Resource}", resource);
         }
+    }
+
+    /// <summary>
+    /// Lock TTL 원자적 갱신 (Lua 스크립트: 소유자 확인 후 PEXPIRE)
+    /// Release-Reacquire 방식의 Race Condition 제거
+    /// </summary>
+    public async Task<bool> RefreshAsync(string resource, TimeSpan? expiry = null)
+    {
+        var lockKey = $"{_lockPrefix}{resource}";
+        var lockExpiry = expiry ?? TimeSpan.FromSeconds(_settings.LockExpirySeconds);
+        var db = _connectionManager.GetDatabase();
+
+        var script = @"
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('pexpire', KEYS[1], ARGV[2])
+            else
+                return 0
+            end";
+
+        var result = await db.ScriptEvaluateAsync(script,
+            new RedisKey[] { lockKey },
+            new RedisValue[] { _lockValue, (long)lockExpiry.TotalMilliseconds });
+
+        var refreshed = (int)result == 1;
+        if (refreshed)
+        {
+            _logger.LogDebug("Lock refreshed: {Resource}, TTL={TTL}ms", resource, lockExpiry.TotalMilliseconds);
+        }
+        else
+        {
+            _logger.LogWarning("Lock refresh failed (not owner or expired): {Resource}", resource);
+        }
+
+        return refreshed;
     }
 
     private async Task<bool> TryAcquireLockAsync(IDatabase db, string lockKey, TimeSpan expiry)

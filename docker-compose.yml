@@ -1,7 +1,5 @@
-version: '3.8'
-
 services:
-  # Concurrency Pattern API
+  # ─── 기본: InMemory 단일 인스턴스 ───
   api:
     build:
       context: ./apps/concurrency-pattern
@@ -10,22 +8,14 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_ENVIRONMENT=Development
       - ASPNETCORE_URLS=http://+:8080
       - UseInMemoryDatabase=true
       - UseRedisQueue=false
-    depends_on:
-      - redis
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/accounts", "||", "exit", "1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
 
-  # Concurrency Pattern API with Redis Queue enabled
-  api-with-redis:
+  # ─── Redis 기존 방식: 단일 Consumer (SPOF) ───
+  api-redis:
     build:
       context: ./apps/concurrency-pattern
       dockerfile: Dockerfile
@@ -33,15 +23,13 @@ services:
     ports:
       - "8081:8080"
     environment:
-      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_ENVIRONMENT=Development
       - ASPNETCORE_URLS=http://+:8080
       - UseInMemoryDatabase=true
       - UseRedisQueue=true
       - Redis__ConnectionString=redis:6379
       - Redis__InstanceName=ConcurrencyPattern
-      - Redis__CommandTimeoutSeconds=30
-      - Redis__LockExpirySeconds=30
-      - Redis__ConsumerGroup=command-processors
+      - Redis__UseStrandMode=false
     depends_on:
       redis:
         condition: service_healthy
@@ -49,7 +37,55 @@ services:
       - redis
     restart: unless-stopped
 
-  # Redis for distributed queue
+  # ─── Strand 모드: N개 Consumer (SPOF 제거) ───
+  #
+  #   Strand Consumer 1        Strand Consumer 2        Strand Consumer 3
+  #   ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+  #   │ Lock:Acc:1   │         │ Lock:Acc:2   │         │ Lock:Inv:1   │
+  #   │ → 순차처리   │         │ → 순차처리   │         │ → 순차처리   │
+  #   └──────┬───────┘         └──────┬───────┘         └──────┬───────┘
+  #          └─────────────────────────┼──────────────────────────┘
+  #                                    ▼
+  #                             ┌──────────────┐
+  #                             │    Redis      │
+  #                             │  (Queues +   │
+  #                             │   Locks)     │
+  #                             └──────────────┘
+  #
+  # 실행:
+  #   docker compose --profile strand up
+  #   (기본 3개 replica, --scale api-strand=5 로 조정 가능)
+  #
+  api-strand:
+    build:
+      context: ./apps/concurrency-pattern
+      dockerfile: Dockerfile
+    ports:
+      - "8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - UseInMemoryDatabase=true
+      - UseRedisQueue=true
+      - Redis__ConnectionString=redis:6379
+      - Redis__InstanceName=ConcurrencyPattern
+      - Redis__UseStrandMode=true
+      - Redis__UseEventDrivenStrand=true
+      - Redis__StrandLeaseSeconds=30
+      - Redis__StrandBatchTimeoutSeconds=5
+      - Redis__StrandMaxBatchSize=100
+      - Redis__StrandDiscoveryIntervalSeconds=2
+      - Redis__StrandMaxIdleIterations=100
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - strand
+    restart: unless-stopped
+    deploy:
+      replicas: 3
+
+  # ─── Redis ───
   redis:
     image: redis:7-alpine
     container_name: concurrency-pattern-redis
@@ -66,7 +102,7 @@ services:
       retries: 5
       start_period: 5s
 
-  # Redis Commander (Web UI for Redis) - optional
+  # ─── Redis Commander (Web UI) ───
   redis-commander:
     image: rediscommander/redis-commander:latest
     container_name: redis-commander

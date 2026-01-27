@@ -44,8 +44,24 @@ public static class ServiceCollectionExtensions
 
         if (useRedis)
         {
-            // Redis Streams + Pub/Sub 기반 분산 큐
-            services.AddRedisInfrastructure(configuration);
+            var useStrandMode = configuration.GetValue<bool>("Redis:UseStrandMode", false);
+            var useEventDriven = configuration.GetValue<bool>("Redis:UseEventDrivenStrand", false);
+
+            if (useStrandMode && useEventDriven)
+            {
+                // Strand + Pub/Sub 하이브리드 (N개 프로세스, 빠른 반응)
+                services.AddRedisEventDrivenStrandInfrastructure(configuration);
+            }
+            else if (useStrandMode)
+            {
+                // Strand Polling 방식 (N개 프로세스, 안정적)
+                services.AddRedisStrandInfrastructure(configuration);
+            }
+            else
+            {
+                // 기존 Context Consumer 방식 (단일 프로세스)
+                services.AddRedisInfrastructure(configuration);
+            }
         }
         else
         {
