@@ -29,6 +29,7 @@ public class RedisListCommandQueue : ISequentialCommandQueue, IDisposable
 
     private readonly string _queuePrefix;
     private readonly string _responseChannelPrefix;
+    private readonly string _strandRegistryKey;
 
     // 응답 대기 중인 커맨드들
     private readonly ConcurrentDictionary<string, TaskCompletionSource<RedisCommandResult>> _pendingCommands = new();
@@ -47,6 +48,7 @@ public class RedisListCommandQueue : ISequentialCommandQueue, IDisposable
 
         _queuePrefix = $"{_settings.InstanceName}:queue:";
         _responseChannelPrefix = $"{_settings.InstanceName}:response:";
+        _strandRegistryKey = $"{_settings.InstanceName}:active-strands";
     }
 
     /// <summary>
@@ -104,13 +106,21 @@ public class RedisListCommandQueue : ISequentialCommandQueue, IDisposable
             var envelope = RedisCommandEnvelope.Create(command, responseChannel);
             var envelopeJson = JsonSerializer.Serialize(envelope);
 
-            // Redis List에 LPUSH (왼쪽에 추가, BRPOP은 오른쪽에서 꺼냄 = FIFO)
+            // Redis List에 LPUSH (왼쪽에 추가, RPOP은 오른쪽에서 꺼냄 = FIFO)
             var db = _connectionManager.GetDatabase();
-            await db.ListLeftPushAsync(queueKey, envelopeJson);
+            var strandKey = $"{command.EntityType}:{command.EntityId}";
+
+            // LPUSH + SADD를 batch로 실행 (Strand Registry에 등록)
+            var batch = db.CreateBatch();
+            var pushTask = batch.ListLeftPushAsync(queueKey, envelopeJson);
+            var registerTask = batch.SetAddAsync(_strandRegistryKey, strandKey);
+            batch.Execute();
+            await pushTask;
+            await registerTask;
 
             _logger.LogDebug(
-                "Command enqueued: CommandId={CommandId}, Queue={Queue}",
-                command.CommandId, queueKey);
+                "Command enqueued: CommandId={CommandId}, Queue={Queue}, Strand={Strand}",
+                command.CommandId, queueKey, strandKey);
 
             // 결과 대기 (타임아웃 적용)
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);

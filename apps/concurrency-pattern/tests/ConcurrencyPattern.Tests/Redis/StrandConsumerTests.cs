@@ -183,16 +183,12 @@ public class StrandConsumerTests
     [Fact]
     public async Task StrandConsumer_ShouldStopGracefully_WhenCancelled()
     {
-        // Arrange
-        var serverMock = new Mock<IServer>();
-        serverMock
-            .Setup(x => x.KeysAsync(
-                It.IsAny<int>(), It.IsAny<RedisValue>(),
-                It.IsAny<int>(), It.IsAny<long>(),
-                It.IsAny<int>(), It.IsAny<CommandFlags>()))
-            .Returns(AsyncEnumerableEmpty());
+        // Arrange - SMEMBERS가 빈 배열 반환
+        var dbMock = new Mock<IDatabase>();
+        dbMock.Setup(x => x.SetMembersAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(Array.Empty<RedisValue>());
 
-        _connectionManagerMock.Setup(x => x.GetServer()).Returns(serverMock.Object);
+        _connectionManagerMock.Setup(x => x.GetDatabase(It.IsAny<int>())).Returns(dbMock.Object);
 
         var consumer = new StrandConsumer(
             _connectionManagerMock.Object,
@@ -210,6 +206,51 @@ public class StrandConsumerTests
 
         // Assert - 예외 없이 종료
         await consumer.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task StrandConsumer_ShouldRemoveFromRegistry_WhenQueueEmpty()
+    {
+        // Arrange
+        var strandKey = "Account:empty";
+
+        _distributedLockMock
+            .Setup(x => x.TryAcquireAsync(
+                $"strand:{strandKey}",
+                It.IsAny<TimeSpan?>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        var dbMock = new Mock<IDatabase>();
+        dbMock.Setup(x => x.ListRightPopAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(RedisValue.Null);
+        dbMock.Setup(x => x.ListLengthAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(0);
+        dbMock.Setup(x => x.SetRemoveAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(true);
+
+        _connectionManagerMock.Setup(x => x.GetDatabase(It.IsAny<int>())).Returns(dbMock.Object);
+
+        var consumer = new StrandConsumer(
+            _connectionManagerMock.Object,
+            _distributedLockMock.Object,
+            _scopeFactoryMock.Object,
+            _settings,
+            _loggerMock.Object);
+
+        using var cts = new CancellationTokenSource();
+
+        // Act
+        await consumer.TryClaimStrandAsync(strandKey, cts.Token);
+        await Task.Delay(500);
+
+        // Assert - 빈 큐의 strand가 registry에서 SREM으로 제거됨
+        dbMock.Verify(
+            x => x.SetRemoveAsync(
+                It.Is<RedisKey>(k => k.ToString() == "test:active-strands"),
+                It.Is<RedisValue>(v => v.ToString() == strandKey),
+                It.IsAny<CommandFlags>()),
+            Times.Once);
     }
 
     [Fact]

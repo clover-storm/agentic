@@ -19,11 +19,14 @@ namespace ConcurrencyPattern.Infrastructure.Redis.Services;
 /// - N개 Consumer 프로세스 지원 (SPOF 제거)
 ///
 /// 동작 원리:
-/// 1. KEYS 스캔으로 활성 Strand(Entity Queue) 발견
+/// 1. Redis Set(active-strands)에서 활성 Strand 목록 조회 (SMEMBERS, O(M))
 /// 2. 각 Strand에 대해 분산 Lock 획득 시도 (Non-blocking)
 /// 3. Lock 획득 성공 시 해당 Strand의 Queue를 순차 처리
 /// 4. Batch 완료 또는 큐가 비면 Lock 해제 → 다른 Consumer가 인계 가능
-/// 5. Consumer 장애 시 Lock TTL 만료 후 자동 인계
+/// 5. 큐가 완전히 비면 Registry에서 제거 (SREM)
+/// 6. Consumer 장애 시 Lock TTL 만료 후 자동 인계
+///
+/// KEYS/SCAN을 사용하지 않음 - Producer가 SADD로 등록한 Set만 조회
 ///
 ///   Consumer 1          Consumer 2          Consumer 3
 ///   ┌─────────┐        ┌─────────┐        ┌─────────┐
@@ -42,6 +45,7 @@ public class StrandConsumer : BackgroundService
     private readonly ILogger _logger;
 
     private readonly string _queuePrefix;
+    private readonly string _strandRegistryKey;
     private readonly string _consumerId;
 
     /// <summary>
@@ -71,6 +75,7 @@ public class StrandConsumer : BackgroundService
         _logger = logger;
 
         _queuePrefix = $"{_settings.InstanceName}:queue:";
+        _strandRegistryKey = $"{_settings.InstanceName}:active-strands";
         _consumerId = $"{Environment.MachineName}:{Guid.NewGuid():N}";
 
         // Strand 설정 (RedisSettings에서 로드)
@@ -104,6 +109,7 @@ public class StrandConsumer : BackgroundService
         _logger = logger;
 
         _queuePrefix = $"{_settings.InstanceName}:queue:";
+        _strandRegistryKey = $"{_settings.InstanceName}:active-strands";
         _consumerId = overrideConsumerId ?? $"{Environment.MachineName}:{Guid.NewGuid():N}";
 
         _strandLeaseTime = TimeSpan.FromSeconds(_settings.StrandLeaseSeconds);
@@ -193,19 +199,19 @@ public class StrandConsumer : BackgroundService
     }
 
     /// <summary>
-    /// Queue Key 패턴에서 활성 Strand 목록 발견
+    /// Strand Registry (Redis Set)에서 활성 Strand 목록 조회
+    /// KEYS/SCAN 대신 SMEMBERS 사용 - O(M) where M = 활성 strand 수
+    /// Producer가 LPUSH 시 SADD로 등록한 Set
     /// </summary>
     private async Task<IReadOnlyList<string>> DiscoverActiveStrandsAsync()
     {
-        var server = _connectionManager.GetServer();
-        var pattern = $"{_queuePrefix}*";
-        var strands = new List<string>();
+        var db = _connectionManager.GetDatabase();
+        var members = await db.SetMembersAsync(_strandRegistryKey);
 
-        await foreach (var key in server.KeysAsync(pattern: pattern))
+        var strands = new List<string>(members.Length);
+        foreach (var member in members)
         {
-            // "ConcurrencyPattern:queue:Account:123" → "Account:123"
-            var strandKey = key.ToString().Replace(_queuePrefix, "");
-            strands.Add(strandKey);
+            strands.Add(member.ToString());
         }
 
         return strands;
@@ -285,6 +291,14 @@ public class StrandConsumer : BackgroundService
         }
         finally
         {
+            // 큐가 비었으면 Registry에서 제거 (다음 enqueue 시 다시 SADD됨)
+            var finalLength = await db.ListLengthAsync(queueKey);
+            if (finalLength == 0)
+            {
+                await db.SetRemoveAsync(_strandRegistryKey, strandKey);
+                _logger.LogDebug("Removed empty strand from registry: {Strand}", strandKey);
+            }
+
             await _distributedLock.ReleaseAsync(lockResource);
             _ownedStrands.TryRemove(strandKey, out _);
             _logger.LogInformation("Released strand: {Strand} by {Consumer}", strandKey, _consumerId);
